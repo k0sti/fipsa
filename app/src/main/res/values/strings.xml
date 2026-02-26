@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FIPS Node</string>
+    <string name="notification_channel_name">FIPS Node Service</string>
+    <string name="notification_channel_description">Keeps the FIPS mesh node running</string>
+</resources>

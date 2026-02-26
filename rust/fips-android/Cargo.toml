@@ -1,0 +1,30 @@
+[package]
+name = "fips-android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "fips_android"
+
+[dependencies]
+jni = "0.21"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
+sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+rand = "0.10.0"
+bech32 = "0.11"
+hex = "0.4"
+log = "0.4"
+android_logger = "0.14"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true

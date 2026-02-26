@@ -1,1 +1,22 @@
 fips-upstream/
+
+# Gradle
+.gradle/
+build/
+local.properties
+
+# Android
+app/build/
+app/src/main/jniLibs/
+
+# Rust
+rust/fips-android/target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
