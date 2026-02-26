@@ -19,7 +19,7 @@ jobs:
       - name: Checkout upstream fips
         uses: actions/checkout@v4
         with:
-          repository: jmcorgan/fips
+          repository: k0sti/fips
           path: fips
 
       - name: Install Rust
@@ -56,7 +56,7 @@ jobs:
       - name: Checkout upstream fips
         uses: actions/checkout@v4
         with:
-          repository: jmcorgan/fips
+          repository: k0sti/fips
           path: fips
 
       - name: Set up JDK 17
@@ -128,7 +128,7 @@ jobs:
       - name: Checkout upstream fips
         uses: actions/checkout@v4
         with:
-          repository: jmcorgan/fips
+          repository: k0sti/fips
           path: fips
 
       - name: Set up JDK 17
