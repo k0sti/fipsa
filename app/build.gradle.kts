@@ -20,7 +20,7 @@ android {
         }
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
     }
 
@@ -112,7 +112,8 @@ tasks.register("buildRustLibs") {
 
         listOf(
             "aarch64-linux-android" to "arm64-v8a",
-            "armv7-linux-androideabi" to "armeabi-v7a"
+            "armv7-linux-androideabi" to "armeabi-v7a",
+            "x86_64-linux-android" to "x86_64"
         ).forEach { (target, abi) ->
             exec {
                 workingDir = rustDir
