@@ -128,6 +128,15 @@ impl FipsNode {
             return;
         }
 
+        // Set local epoch (random bytes for restart detection)
+        let mut epoch = [0u8; 8];
+        epoch.copy_from_slice(&std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes()[..8]);
+        hs.set_local_epoch(epoch);
+
         // Write msg2
         let msg2_noise = match hs.write_message_2() {
             Ok(msg) => msg,
@@ -375,5 +384,128 @@ impl FipsNode {
         self.running = false;
         self.peers.clear();
         log::info!("FIPS node shut down");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_identity_generate_and_npub() {
+        let identity = Identity::generate();
+        let npub = identity.npub();
+        assert!(npub.starts_with("npub1"));
+        // Generate a second — should be different
+        let identity2 = Identity::generate();
+        assert_ne!(identity.npub(), identity2.npub());
+    }
+
+    #[test]
+    fn test_identity_from_secret_str() {
+        let identity = Identity::generate();
+        // Round-trip via hex secret key
+        let hex_secret = hex::encode(identity.keypair().secret_key().secret_bytes());
+        let restored = Identity::from_secret_str(&hex_secret).unwrap();
+        assert_eq!(identity.npub(), restored.npub());
+    }
+
+    #[test]
+    fn test_node_addr_from_identity() {
+        let identity = Identity::generate();
+        let addr = identity.node_addr();
+        assert_eq!(addr.as_bytes().len(), 16);
+        // Node address should be deterministic from pubkey
+        let addr2 = NodeAddr::from_pubkey(&identity.pubkey());
+        assert_eq!(addr.as_bytes(), addr2.as_bytes());
+    }
+
+    #[test]
+    fn test_peer_identity_roundtrip() {
+        let identity = Identity::generate();
+        let peer = PeerIdentity::from_pubkey(identity.pubkey());
+        assert_eq!(peer.npub(), identity.npub());
+        assert_eq!(peer.node_addr().as_bytes(), identity.node_addr().as_bytes());
+    }
+
+    #[test]
+    fn test_noise_handshake_ik() {
+        // Simulate a full IK handshake between initiator and responder
+        let initiator_id = Identity::generate();
+        let responder_id = Identity::generate();
+
+        // Initiator creates msg1
+        let mut hs_i = HandshakeState::new_initiator(
+            initiator_id.keypair(),
+            responder_id.pubkey_full(),
+        );
+        hs_i.set_local_epoch([1, 2, 3, 4, 5, 6, 7, 8]);
+        let msg1 = hs_i.write_message_1().unwrap();
+
+        // Responder reads msg1, writes msg2
+        let mut hs_r = HandshakeState::new_responder(responder_id.keypair());
+        hs_r.read_message_1(&msg1).unwrap();
+        hs_r.set_local_epoch([8, 7, 6, 5, 4, 3, 2, 1]);
+        let msg2 = hs_r.write_message_2().unwrap();
+
+        // Initiator reads msg2
+        hs_i.read_message_2(&msg2).unwrap();
+
+        // Both complete into sessions
+        let mut session_i = hs_i.into_session().unwrap();
+        let mut session_r = hs_r.into_session().unwrap();
+
+        // Verify they can communicate
+        let plaintext = b"hello fips mesh";
+        let encrypted = session_i.encrypt(plaintext).unwrap();
+        let decrypted = session_r.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // And in reverse
+        let encrypted2 = session_r.encrypt(b"hello back").unwrap();
+        let decrypted2 = session_i.decrypt(&encrypted2).unwrap();
+        assert_eq!(decrypted2, b"hello back");
+    }
+
+    #[test]
+    fn test_link_message_type_roundtrip() {
+        let heartbeat = LinkMessageType::Heartbeat;
+        let byte = heartbeat as u8;
+        let parsed = LinkMessageType::from_byte(byte).unwrap();
+        assert_eq!(parsed, heartbeat);
+    }
+
+    #[test]
+    fn test_peer_info_serialization() {
+        let info = PeerInfo {
+            npub: "npub1test".into(),
+            node_addr: "deadbeef".into(),
+            transport_id: 1,
+            remote_addr: "192.168.1.1:4000".into(),
+            connected: true,
+            last_seen_ms: 100,
+            packets_rx: 42,
+            packets_tx: 37,
+            bytes_rx: 4200,
+            bytes_tx: 3700,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"npub\":\"npub1test\""));
+        assert!(json.contains("\"connected\":true"));
+    }
+
+    #[test]
+    fn test_node_status_serialization() {
+        let status = NodeStatus {
+            npub: "npub1test".into(),
+            node_addr: "abcd1234".into(),
+            state: "running".into(),
+            peer_count: 3,
+            uptime_secs: 120,
+            total_packets_rx: 100,
+            total_packets_tx: 80,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"peer_count\":3"));
+        assert!(json.contains("\"state\":\"running\""));
     }
 }
