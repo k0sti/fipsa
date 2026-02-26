@@ -18,7 +18,8 @@ class TransportManager(
         private const val TAG = "TransportManager"
     }
 
-    private val transports = mutableMapOf<Int, FipsTransport>()
+    @PublishedApi
+    internal val transports = mutableMapOf<Int, FipsTransport>()
 
     val allTransports: List<FipsTransport>
         get() = transports.values.toList()
