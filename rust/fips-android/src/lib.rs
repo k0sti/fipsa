@@ -1,12 +1,9 @@
 //! FIPS Android JNI Bridge
 //!
-//! Standalone implementation of core FIPS node functionality for Android.
-//! Does not depend on the upstream fips crate directly (due to tun/rtnetlink deps),
-//! instead reimplements the essential protocol/identity/noise layers.
+//! Uses the upstream fips crate (core feature) for identity, noise, and
+//! protocol types. The JNI bridge handles Android-specific concerns:
+//! external packet injection via JNI callbacks and simplified node state.
 
-mod identity;
-mod noise;
-mod protocol;
 mod node;
 
 use jni::JNIEnv;

@@ -1,7 +1,8 @@
 //! Simplified FIPS node for Android.
 //!
-//! Manages identity, peer connections, Noise sessions, and packet routing.
-//! Designed for external packet injection (no built-in transport or TUN).
+//! Uses upstream fips crate types for identity, noise handshake, and protocol
+//! message types. Manages peer connections and packet routing with external
+//! packet injection via JNI callbacks (no built-in transport or TUN).
 
 use std::collections::HashMap;
 use std::time::{Instant, Duration};
@@ -10,9 +11,11 @@ use jni::JavaVM;
 use jni::objects::GlobalRef;
 use serde::Serialize;
 
-use crate::identity::{Identity, NodeAddr};
-use crate::noise::{NoiseSession, HandshakeState};
-use crate::protocol::{self, LinkMessageType};
+use fips::Identity;
+use fips::NodeAddr;
+use fips::PeerIdentity;
+use fips::noise::{HandshakeState, NoiseSession};
+use fips::protocol::LinkMessageType;
 
 /// Peer state tracked by the node.
 struct Peer {
@@ -72,7 +75,8 @@ pub struct FipsNode {
 impl FipsNode {
     /// Create a new node with the given nsec identity.
     pub fn new(nsec: &str, jvm: JavaVM, callback: GlobalRef) -> Result<Self, String> {
-        let identity = Identity::from_nsec(nsec)?;
+        let identity = Identity::from_secret_str(nsec)
+            .map_err(|e| format!("identity error: {}", e))?;
         log::info!("FIPS node initialized: {}", identity.npub());
 
         Ok(Self {
@@ -114,60 +118,81 @@ impl FipsNode {
     }
 
     fn handle_handshake_msg1(&mut self, data: &[u8], transport_id: u32, remote_addr: &str) {
-        match NoiseSession::respond(
-            self.identity.secret_key(),
-            self.identity.public_key(),
-            data,
-        ) {
-            Ok((msg2, session)) => {
-                let remote_pub = session.remote_pubkey;
-                let mut node_addr = [0u8; 16];
-                let hash = sha2::Sha256::digest(remote_pub.serialize());
-                node_addr.copy_from_slice(&hash[..16]);
+        // Create responder handshake state using upstream noise
+        let keypair = self.identity.keypair();
+        let mut hs = HandshakeState::new_responder(keypair);
 
-                // Compute npub for the remote peer
-                let serialized = remote_pub.serialize();
-                let x_only = &serialized[1..33];
-                let hrp = bech32::Hrp::parse("npub").unwrap();
-                let npub = bech32::encode::<bech32::Bech32>(hrp, x_only)
-                    .unwrap_or_default();
-
-                let now = Instant::now();
-                self.peers.insert(remote_addr.to_string(), Peer {
-                    node_addr,
-                    npub,
-                    transport_id,
-                    remote_addr: remote_addr.to_string(),
-                    session: Some(session),
-                    pending_handshake: None,
-                    last_seen: now,
-                    last_heartbeat_sent: now,
-                    packets_rx: 1,
-                    packets_tx: 0,
-                    bytes_rx: data.len() as u64,
-                    bytes_tx: 0,
-                });
-
-                self.send_packet(transport_id, remote_addr, &msg2);
-                log::info!("Handshake completed (responder) with {}", remote_addr);
-            }
-            Err(e) => {
-                log::warn!("Handshake msg1 failed from {}: {}", remote_addr, e);
-            }
+        // Read the Noise IK msg1 (skip the type prefix byte)
+        if let Err(e) = hs.read_message_1(&data[1..]) {
+            log::warn!("Handshake msg1 failed from {}: {}", remote_addr, e);
+            return;
         }
+
+        // Write msg2
+        let msg2_noise = match hs.write_message_2() {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::warn!("Failed to write msg2 for {}: {}", remote_addr, e);
+                return;
+            }
+        };
+
+        // Complete the handshake into a session
+        let session = match hs.into_session() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to create session for {}: {}", remote_addr, e);
+                return;
+            }
+        };
+
+        // Identify the remote peer from the session's remote static key
+        let remote_pubkey = *session.remote_static();
+        let peer_identity = PeerIdentity::from_pubkey_full(remote_pubkey);
+        let node_addr = *peer_identity.node_addr();
+        let npub = peer_identity.npub();
+
+        let now = Instant::now();
+        self.peers.insert(remote_addr.to_string(), Peer {
+            node_addr,
+            npub,
+            transport_id,
+            remote_addr: remote_addr.to_string(),
+            session: Some(session),
+            pending_handshake: None,
+            last_seen: now,
+            last_heartbeat_sent: now,
+            packets_rx: 1,
+            packets_tx: 0,
+            bytes_rx: data.len() as u64,
+            bytes_tx: 0,
+        });
+
+        // Send msg2 with type prefix
+        let mut wire_msg2 = Vec::with_capacity(1 + msg2_noise.len());
+        wire_msg2.push(0x02);
+        wire_msg2.extend_from_slice(&msg2_noise);
+        self.send_packet(transport_id, remote_addr, &wire_msg2);
+        log::info!("Handshake completed (responder) with {}", remote_addr);
     }
 
     fn handle_handshake_msg2(&mut self, data: &[u8], remote_addr: &str) {
         if let Some(peer) = self.peers.get_mut(remote_addr) {
-            if let Some(hs) = peer.pending_handshake.take() {
-                match hs.complete(data) {
+            if let Some(mut hs) = peer.pending_handshake.take() {
+                // Read the Noise IK msg2 (skip the type prefix byte)
+                if let Err(e) = hs.read_message_2(&data[1..]) {
+                    log::warn!("Handshake msg2 failed from {}: {}", remote_addr, e);
+                    return;
+                }
+
+                match hs.into_session() {
                     Ok(session) => {
                         peer.session = Some(session);
                         peer.last_seen = Instant::now();
                         log::info!("Handshake completed (initiator) with {}", remote_addr);
                     }
                     Err(e) => {
-                        log::warn!("Handshake msg2 failed from {}: {}", remote_addr, e);
+                        log::warn!("Session creation failed from {}: {}", remote_addr, e);
                     }
                 }
             }
@@ -181,9 +206,13 @@ impl FipsNode {
             peer.bytes_rx += data.len() as u64;
 
             if let Some(session) = &mut peer.session {
-                match session.decrypt_message(data) {
-                    Ok((msg_type, _payload)) => {
-                        if let Some(link_type) = LinkMessageType::from_u8(msg_type) {
+                match session.decrypt(data) {
+                    Ok(plaintext) => {
+                        if plaintext.is_empty() {
+                            return;
+                        }
+                        let msg_type = plaintext[0];
+                        if let Some(link_type) = LinkMessageType::from_byte(msg_type) {
                             match link_type {
                                 LinkMessageType::Heartbeat => {
                                     // Heartbeat received, already updated last_seen
@@ -266,31 +295,38 @@ impl FipsNode {
         for (tid, addr) in needs_heartbeat {
             if let Some(peer) = self.peers.get_mut(&addr) {
                 if let Some(session) = &mut peer.session {
-                    let heartbeat = protocol::build_heartbeat();
-                    let encrypted = session.encrypt_message(
-                        LinkMessageType::Heartbeat as u8,
-                        &heartbeat[1..], // skip type byte, it's added by encrypt_message
-                    );
-                    peer.last_heartbeat_sent = now;
-                    peer.packets_tx += 1;
-                    peer.bytes_tx += encrypted.len() as u64;
-                    self.total_tx += 1;
+                    // Build heartbeat: type byte + 8-byte timestamp placeholder
+                    let mut plaintext = Vec::with_capacity(9);
+                    plaintext.push(LinkMessageType::Heartbeat as u8);
+                    plaintext.extend_from_slice(&[0u8; 8]);
 
-                    // Send via callback
-                    if let Ok(mut env) = self.jvm.attach_current_thread() {
-                        if let Ok(byte_array) = env.byte_array_from_slice(&encrypted) {
-                            if let Ok(addr_str) = env.new_string(&addr) {
-                                let _ = env.call_method(
-                                    &self.callback,
-                                    "onPacket",
-                                    "([BILjava/lang/String;)V",
-                                    &[
-                                        (&byte_array).into(),
-                                        (tid as i32).into(),
-                                        (&addr_str).into(),
-                                    ],
-                                );
+                    match session.encrypt(&plaintext) {
+                        Ok(encrypted) => {
+                            peer.last_heartbeat_sent = now;
+                            peer.packets_tx += 1;
+                            peer.bytes_tx += encrypted.len() as u64;
+                            self.total_tx += 1;
+
+                            // Send via callback
+                            if let Ok(mut env) = self.jvm.attach_current_thread() {
+                                if let Ok(byte_array) = env.byte_array_from_slice(&encrypted) {
+                                    if let Ok(addr_str) = env.new_string(&addr) {
+                                        let _ = env.call_method(
+                                            &self.callback,
+                                            "onPacket",
+                                            "([BILjava/lang/String;)V",
+                                            &[
+                                                (&byte_array).into(),
+                                                (tid as i32).into(),
+                                                (&addr_str).into(),
+                                            ],
+                                        );
+                                    }
+                                }
                             }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to encrypt heartbeat for {}: {}", addr, e);
                         }
                     }
                 }
@@ -304,7 +340,7 @@ impl FipsNode {
             let now = Instant::now();
             PeerInfo {
                 npub: p.npub.clone(),
-                node_addr: hex::encode(p.node_addr),
+                node_addr: hex::encode(p.node_addr.as_bytes()),
                 transport_id: p.transport_id,
                 remote_addr: p.remote_addr.clone(),
                 connected: p.session.is_some(),
@@ -323,7 +359,7 @@ impl FipsNode {
     pub fn get_status_json(&self) -> String {
         let status = NodeStatus {
             npub: self.identity.npub(),
-            node_addr: hex::encode(self.identity.node_addr()),
+            node_addr: hex::encode(self.identity.node_addr().as_bytes()),
             state: if self.running { "running" } else { "stopped" }.into(),
             peer_count: self.peers.len(),
             uptime_secs: self.started.elapsed().as_secs(),
@@ -341,5 +377,3 @@ impl FipsNode {
         log::info!("FIPS node shut down");
     }
 }
-
-use sha2::Digest as _;
